@@ -31,6 +31,7 @@ function broadcast(data) {
 
 // GMod posts here as form-urlencoded: { data: "<json string>" }
 app.post("/telemetry", (req, res) => {
+	console.log("Received telemetry:", req.body);
 	if (!req.body.data) {
 		return res.status(400).json({ error: "Missing 'data' field" });
 	}
