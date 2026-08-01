@@ -3,7 +3,7 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const app = express();
-app.use(express.urlencoded({ extended: true })); // parses form-urlencoded body
+app.use(express.urlencoded({ extended: true }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -29,7 +29,6 @@ function broadcast(data) {
 	}
 }
 
-// GMod posts here as form-urlencoded: { data: "<json string>" }
 app.post("/telemetry", (req, res) => {
 	if (!req.body.data) {
 		return res.status(400).json({ error: "Missing 'data' field" });
@@ -42,13 +41,23 @@ app.post("/telemetry", (req, res) => {
 		return res.status(400).json({ error: "Invalid JSON in 'data' field" });
 	}
 
-	const { name, x, y, z, vel, pitch, yaw, roll, time } = parsed;
+	const { name, x, y, z, vel, pitch, yaw, roll, time, gamemode, role, health, role_r, role_g, role_b } = parsed;
 
 	if (typeof name !== "string" || [x, y, z, yaw, time].some((v) => typeof v !== "number")) {
 		return res.status(400).json({ error: "Invalid telemetry payload" });
 	}
 
-	broadcast({ type: "player_update", player: name, x, y, z, vel, pitch, yaw, roll, time });
+	broadcast({
+		type: "player_update",
+		player: name,
+		x, y, z, vel, pitch, yaw, roll, time,
+		gamemode: gamemode || "unknown",
+		role: role || "unknown",
+		health: health,
+		role_r: typeof role_r === "number" ? role_r : 255,
+		role_g: typeof role_g === "number" ? role_g : 255,
+		role_b: typeof role_b === "number" ? role_b : 255,
+	});
 	res.status(200).json({ ok: true });
 });
 
