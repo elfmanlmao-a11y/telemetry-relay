@@ -41,7 +41,7 @@ app.post("/telemetry", (req, res) => {
 		return res.status(400).json({ error: "Invalid JSON in 'data' field" });
 	}
 
-	const { name, x, y, z, vel, pitch, yaw, roll, time, gamemode, role, health, role_r, role_g, role_b } = parsed;
+	const { name, x, y, z, vel, pitch, yaw, roll, time, gamemode, role, health, role_r, role_g, role_b, is_spectating } = parsed;
 
 	if (typeof name !== "string" || [x, y, z, yaw, time].some((v) => typeof v !== "number")) {
 		return res.status(400).json({ error: "Invalid telemetry payload" });
@@ -57,6 +57,7 @@ app.post("/telemetry", (req, res) => {
 		role_r: typeof role_r === "number" ? role_r : 255,
 		role_g: typeof role_g === "number" ? role_g : 255,
 		role_b: typeof role_b === "number" ? role_b : 255,
+		is_spectating: !!is_spectating,
 	});
 	res.status(200).json({ ok: true });
 });
