@@ -4,7 +4,6 @@ const { WebSocketServer } = require("ws");
 
 const app = express();
 
-// Limit body size — telemetry payloads are tiny, no legitimate reason for a large body
 app.use(express.urlencoded({ extended: true, limit: "10kb" }));
 
 const server = http.createServer(app);
@@ -12,14 +11,10 @@ const wss = new WebSocketServer({ server });
 
 const clients = new Set();
 
-// --- Shared secret for GMod -> relay writes ---
 const TELEMETRY_SECRET = process.env.TELEMETRY_SECRET;
 
-// --- Simple in-memory rate limiter for /telemetry ---
-// Since telemetry comes from your own GMod server, this just guards against abuse/flooding,
-// not legitimate traffic.
 const RATE_LIMIT_WINDOW_MS = 1000;
-const RATE_LIMIT_MAX = 50; // generous, since one server posts once per player per tick
+const RATE_LIMIT_MAX = 50;
 let requestTimestamps = [];
 
 function isRateLimited() {
@@ -30,7 +25,6 @@ function isRateLimited() {
 }
 
 wss.on("connection", (ws, req) => {
-	// Cap total concurrent viewers to avoid resource exhaustion from abuse
 	const MAX_CLIENTS = 200;
 	if (clients.size >= MAX_CLIENTS) {
 		ws.close(1013, "Too many connections");
@@ -45,12 +39,10 @@ wss.on("connection", (ws, req) => {
 		console.log(`Client disconnected. Total clients: ${clients.size}`);
 	});
 
-	// Basic dead-connection cleanup
 	ws.isAlive = true;
 	ws.on("pong", () => { ws.isAlive = true; });
 });
 
-// Periodically ping clients and drop ones that stop responding
 setInterval(() => {
 	for (const ws of clients) {
 		if (ws.isAlive === false) {
@@ -77,8 +69,9 @@ app.post("/telemetry", (req, res) => {
 		return res.status(429).json({ error: "Too many requests" });
 	}
 
-	// Require the shared secret, sent as a header from Lua
 	if (!TELEMETRY_SECRET || req.get("X-Telemetry-Secret") !== TELEMETRY_SECRET) {
+		console.log("Rejected telemetry — secret mismatch. Received:", req.get("X-Telemetry-Secret"));
+		console.log("Expected (from env):", TELEMETRY_SECRET ? "[set, length " + TELEMETRY_SECRET.length + "]" : "[NOT SET]");
 		return res.status(401).json({ error: "Unauthorized" });
 	}
 
@@ -97,7 +90,6 @@ app.post("/telemetry", (req, res) => {
 	        role_r, role_g, role_b, is_spectating, wall_hit, ground_hit, impact_strength,
 	        took_damage, damage_amount, was_fall_damage } = parsed;
 
-	// Tighter validation — reject absurd/out-of-range values, not just wrong types
 	if (
 		typeof name !== "string" || name.length === 0 || name.length > 64 ||
 		[x, y, z, yaw, time].some((v) => typeof v !== "number" || !Number.isFinite(v))
