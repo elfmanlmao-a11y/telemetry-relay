@@ -1,10 +1,13 @@
 const express = require("express");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const { WebSocketServer } = require("ws");
 
 const app = express();
 
 app.use(express.urlencoded({ extended: true, limit: "10kb" }));
+app.use(express.json({ limit: "1mb" }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -24,7 +27,7 @@ function isRateLimited() {
 	return requestTimestamps.length > RATE_LIMIT_MAX;
 }
 
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
 	const MAX_CLIENTS = 200;
 	if (clients.size >= MAX_CLIENTS) {
 		ws.close(1013, "Too many connections");
@@ -64,14 +67,123 @@ function broadcast(data) {
 	}
 }
 
+// --- Recording state ---
+const RECORDINGS_DIR = path.join(__dirname, "recordings");
+if (!fs.existsSync(RECORDINGS_DIR)) {
+	fs.mkdirSync(RECORDINGS_DIR);
+}
+
+// activeRecording.frames: { player_name: [ {time,x,y,z,yaw}, ... ] }
+// activeRecording.gamemode_counts: { "Hunted": 42, "none": 3 } — tally of gamemode seen per frame,
+// used afterward to pick the most representative gamemode label for the whole session
+let activeRecording = null;
+
+function requireSecret(req, res) {
+	if (!TELEMETRY_SECRET || req.get("X-Telemetry-Secret") !== TELEMETRY_SECRET) {
+		res.status(401).json({ error: "Unauthorized" });
+		return false;
+	}
+	return true;
+}
+
+function mostCommonGamemode(counts) {
+	let best = "unknown";
+	let bestCount = -1;
+	for (const [gamemode, count] of Object.entries(counts)) {
+		if (count > bestCount) {
+			best = gamemode;
+			bestCount = count;
+		}
+	}
+	return best;
+}
+
+app.post("/recording/start", (req, res) => {
+	if (!requireSecret(req, res)) return;
+
+	if (activeRecording) {
+		return res.status(400).json({ error: "A recording is already in progress" });
+	}
+
+	activeRecording = {
+		id: Date.now().toString(),
+		started_at: Date.now(),
+		frames: {},
+		gamemode_counts: {},
+	};
+
+	console.log("Recording started:", activeRecording.id);
+	res.status(200).json({ ok: true, id: activeRecording.id });
+});
+
+app.post("/recording/stop", (req, res) => {
+	if (!requireSecret(req, res)) return;
+
+	if (!activeRecording) {
+		return res.status(400).json({ error: "No recording in progress" });
+	}
+
+	const finished = activeRecording;
+	activeRecording = null;
+
+	const playerNames = Object.keys(finished.frames);
+	const gamemode = mostCommonGamemode(finished.gamemode_counts);
+
+	const metadata = {
+		id: finished.id,
+		gamemode: gamemode,
+		player_count: playerNames.length,
+		player_names: playerNames,
+		duration_seconds: (Date.now() - finished.started_at) / 1000,
+		saved_at: Date.now(),
+	};
+
+	const output = {
+		metadata: metadata,
+		frames: finished.frames,
+	};
+
+	const filePath = path.join(RECORDINGS_DIR, `${finished.id}.json`);
+	fs.writeFileSync(filePath, JSON.stringify(output));
+
+	console.log("Recording saved:", finished.id, metadata);
+	res.status(200).json({ ok: true, id: finished.id, metadata: metadata });
+});
+
+// Public — list available recordings with metadata, sortable client-side
+app.get("/recordings", (req, res) => {
+	const files = fs.readdirSync(RECORDINGS_DIR).filter((f) => f.endsWith(".json"));
+
+	const list = files.map((f) => {
+		const raw = fs.readFileSync(path.join(RECORDINGS_DIR, f), "utf8");
+		const parsed = JSON.parse(raw);
+		return parsed.metadata;
+	});
+
+	// Default sort: newest first
+	list.sort((a, b) => b.saved_at - a.saved_at);
+
+	res.status(200).json({ recordings: list });
+});
+
+// Public — fetch full recording data for playback
+app.get("/recordings/:id", (req, res) => {
+	const filePath = path.join(RECORDINGS_DIR, `${req.params.id}.json`);
+
+	if (!fs.existsSync(filePath)) {
+		return res.status(404).json({ error: "Recording not found" });
+	}
+
+	const data = fs.readFileSync(filePath, "utf8");
+	res.status(200).send(data);
+});
+
 app.post("/telemetry", (req, res) => {
 	if (isRateLimited()) {
 		return res.status(429).json({ error: "Too many requests" });
 	}
 
 	if (!TELEMETRY_SECRET || req.get("X-Telemetry-Secret") !== TELEMETRY_SECRET) {
-		console.log("Rejected telemetry — secret mismatch. Received:", req.get("X-Telemetry-Secret"));
-		console.log("Expected (from env):", TELEMETRY_SECRET ? "[set, length " + TELEMETRY_SECRET.length + "]" : "[NOT SET]");
 		return res.status(401).json({ error: "Unauthorized" });
 	}
 
@@ -95,6 +207,17 @@ app.post("/telemetry", (req, res) => {
 		[x, y, z, yaw, time].some((v) => typeof v !== "number" || !Number.isFinite(v))
 	) {
 		return res.status(400).json({ error: "Invalid telemetry payload" });
+	}
+
+	if (activeRecording && !is_spectating) {
+		if (!activeRecording.frames[name]) {
+			activeRecording.frames[name] = [];
+		}
+		const relative_time = (Date.now() - activeRecording.started_at) / 1000;
+		activeRecording.frames[name].push({ time: relative_time, x, y, z, yaw });
+
+		const gm = gamemode || "unknown";
+		activeRecording.gamemode_counts[gm] = (activeRecording.gamemode_counts[gm] || 0) + 1;
 	}
 
 	broadcast({
