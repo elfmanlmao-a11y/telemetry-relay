@@ -3,14 +3,40 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+
+// Limit body size — telemetry payloads are tiny, no legitimate reason for a large body
+app.use(express.urlencoded({ extended: true, limit: "10kb" }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 const clients = new Set();
 
-wss.on("connection", (ws) => {
+// --- Shared secret for GMod -> relay writes ---
+const TELEMETRY_SECRET = process.env.TELEMETRY_SECRET;
+
+// --- Simple in-memory rate limiter for /telemetry ---
+// Since telemetry comes from your own GMod server, this just guards against abuse/flooding,
+// not legitimate traffic.
+const RATE_LIMIT_WINDOW_MS = 1000;
+const RATE_LIMIT_MAX = 50; // generous, since one server posts once per player per tick
+let requestTimestamps = [];
+
+function isRateLimited() {
+	const now = Date.now();
+	requestTimestamps = requestTimestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+	requestTimestamps.push(now);
+	return requestTimestamps.length > RATE_LIMIT_MAX;
+}
+
+wss.on("connection", (ws, req) => {
+	// Cap total concurrent viewers to avoid resource exhaustion from abuse
+	const MAX_CLIENTS = 200;
+	if (clients.size >= MAX_CLIENTS) {
+		ws.close(1013, "Too many connections");
+		return;
+	}
+
 	clients.add(ws);
 	console.log(`Client connected. Total clients: ${clients.size}`);
 
@@ -18,7 +44,24 @@ wss.on("connection", (ws) => {
 		clients.delete(ws);
 		console.log(`Client disconnected. Total clients: ${clients.size}`);
 	});
+
+	// Basic dead-connection cleanup
+	ws.isAlive = true;
+	ws.on("pong", () => { ws.isAlive = true; });
 });
+
+// Periodically ping clients and drop ones that stop responding
+setInterval(() => {
+	for (const ws of clients) {
+		if (ws.isAlive === false) {
+			ws.terminate();
+			clients.delete(ws);
+			continue;
+		}
+		ws.isAlive = false;
+		ws.ping();
+	}
+}, 30000);
 
 function broadcast(data) {
 	const payload = JSON.stringify(data);
@@ -30,6 +73,15 @@ function broadcast(data) {
 }
 
 app.post("/telemetry", (req, res) => {
+	if (isRateLimited()) {
+		return res.status(429).json({ error: "Too many requests" });
+	}
+
+	// Require the shared secret, sent as a header from Lua
+	if (!TELEMETRY_SECRET || req.get("X-Telemetry-Secret") !== TELEMETRY_SECRET) {
+		return res.status(401).json({ error: "Unauthorized" });
+	}
+
 	if (!req.body.data) {
 		return res.status(400).json({ error: "Missing 'data' field" });
 	}
@@ -45,7 +97,11 @@ app.post("/telemetry", (req, res) => {
 	        role_r, role_g, role_b, is_spectating, wall_hit, ground_hit, impact_strength,
 	        took_damage, damage_amount, was_fall_damage } = parsed;
 
-	if (typeof name !== "string" || [x, y, z, yaw, time].some((v) => typeof v !== "number")) {
+	// Tighter validation — reject absurd/out-of-range values, not just wrong types
+	if (
+		typeof name !== "string" || name.length === 0 || name.length > 64 ||
+		[x, y, z, yaw, time].some((v) => typeof v !== "number" || !Number.isFinite(v))
+	) {
 		return res.status(400).json({ error: "Invalid telemetry payload" });
 	}
 
@@ -70,7 +126,6 @@ app.post("/telemetry", (req, res) => {
 	res.status(200).json({ ok: true });
 });
 
-// NEW: simple GET endpoint GMod can poll for current viewer count
 app.get("/viewers", (req, res) => {
 	res.status(200).json({ viewers: clients.size });
 });
