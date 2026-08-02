@@ -67,15 +67,11 @@ function broadcast(data) {
 	}
 }
 
-// --- Recording state ---
 const RECORDINGS_DIR = path.join(__dirname, "recordings");
 if (!fs.existsSync(RECORDINGS_DIR)) {
 	fs.mkdirSync(RECORDINGS_DIR);
 }
 
-// activeRecording.frames: { player_name: [ {time,x,y,z,yaw}, ... ] }
-// activeRecording.gamemode_counts: { "Hunted": 42, "none": 3 } — tally of gamemode seen per frame,
-// used afterward to pick the most representative gamemode label for the whole session
 let activeRecording = null;
 
 function requireSecret(req, res) {
@@ -150,7 +146,6 @@ app.post("/recording/stop", (req, res) => {
 	res.status(200).json({ ok: true, id: finished.id, metadata: metadata });
 });
 
-// Public — list available recordings with metadata, sortable client-side
 app.get("/recordings", (req, res) => {
 	const files = fs.readdirSync(RECORDINGS_DIR).filter((f) => f.endsWith(".json"));
 
@@ -160,13 +155,11 @@ app.get("/recordings", (req, res) => {
 		return parsed.metadata;
 	});
 
-	// Default sort: newest first
 	list.sort((a, b) => b.saved_at - a.saved_at);
 
 	res.status(200).json({ recordings: list });
 });
 
-// Public — fetch full recording data for playback
 app.get("/recordings/:id", (req, res) => {
 	const filePath = path.join(RECORDINGS_DIR, `${req.params.id}.json`);
 
@@ -214,7 +207,13 @@ app.post("/telemetry", (req, res) => {
 			activeRecording.frames[name] = [];
 		}
 		const relative_time = (Date.now() - activeRecording.started_at) / 1000;
-		activeRecording.frames[name].push({ time: relative_time, x, y, z, yaw });
+		activeRecording.frames[name].push({
+			time: relative_time,
+			x, y, z, yaw,
+			role_r: typeof role_r === "number" ? role_r : 255,
+			role_g: typeof role_g === "number" ? role_g : 255,
+			role_b: typeof role_b === "number" ? role_b : 255,
+		});
 
 		const gm = gamemode || "unknown";
 		activeRecording.gamemode_counts[gm] = (activeRecording.gamemode_counts[gm] || 0) + 1;
