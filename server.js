@@ -6,6 +6,21 @@ const { WebSocketServer } = require("ws");
 
 const app = express();
 
+// Allow the deployed WebXR site (or any origin) to read responses from this relay.
+// Without this, browser-based fetch/XHR requests from emmlive.onrender.com are
+// silently blocked client-side even if the server responds successfully —
+// this is why the Godot editor (not subject to CORS) could see recordings
+// but the deployed web build could not.
+app.use((req, res, next) => {
+	res.header("Access-Control-Allow-Origin", "*");
+	res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+	res.header("Access-Control-Allow-Headers", "Content-Type, X-Telemetry-Secret");
+	if (req.method === "OPTIONS") {
+		return res.sendStatus(200);
+	}
+	next();
+});
+
 app.use(express.urlencoded({ extended: true, limit: "10kb" }));
 app.use(express.json({ limit: "1mb" }));
 
