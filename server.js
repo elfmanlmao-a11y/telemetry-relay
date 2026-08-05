@@ -31,8 +31,15 @@ const clients = new Set();
 
 const TELEMETRY_SECRET = process.env.TELEMETRY_SECRET;
 
+// Rate limit is per-connection-window, not truly per-player, but it's raised
+// well above what a full server of players would need at the tracker's
+// current tick rate. The old cap of 50/sec globally was actually LOWER than
+// what ~5+ players at 10Hz would produce on their own (50+ req/sec), meaning
+// legitimate telemetry was already hitting 429s under normal play — worth
+// raising regardless of the Lua-side tick-rate change, since this endpoint
+// already requires the shared secret and isn't exposed to public abuse.
 const RATE_LIMIT_WINDOW_MS = 1000;
-const RATE_LIMIT_MAX = 50;
+const RATE_LIMIT_MAX = 60; // batched now: one request per tick covers every player
 let requestTimestamps = [];
 
 function isRateLimited() {
@@ -186,26 +193,12 @@ app.get("/recordings/:id", (req, res) => {
 	res.status(200).send(data);
 });
 
-app.post("/telemetry", (req, res) => {
-	if (isRateLimited()) {
-		return res.status(429).json({ error: "Too many requests" });
-	}
-
-	if (!TELEMETRY_SECRET || req.get("X-Telemetry-Secret") !== TELEMETRY_SECRET) {
-		return res.status(401).json({ error: "Unauthorized" });
-	}
-
-	if (!req.body.data) {
-		return res.status(400).json({ error: "Missing 'data' field" });
-	}
-
-	let parsed;
-	try {
-		parsed = JSON.parse(req.body.data);
-	} catch (e) {
-		return res.status(400).json({ error: "Invalid JSON in 'data' field" });
-	}
-
+// Shared processing for a single player's telemetry entry: validates,
+// records (if active), and broadcasts. Used by both /telemetry (single,
+// kept for compatibility) and /telemetry/batch (one POST covering every
+// player on a tick, instead of one POST per player per tick).
+// Returns true if the entry was valid and processed, false otherwise.
+function processTelemetryEntry(parsed) {
 	const { name, x, y, z, vel, vel_x, vel_y, vel_z, pitch, yaw, roll, time, gamemode, role, health,
 	        role_r, role_g, role_b, is_spectating, wall_hit, ground_hit, impact_strength,
 	        took_damage, damage_amount, was_fall_damage } = parsed;
@@ -214,7 +207,7 @@ app.post("/telemetry", (req, res) => {
 		typeof name !== "string" || name.length === 0 || name.length > 64 ||
 		[x, y, z, yaw, time].some((v) => typeof v !== "number" || !Number.isFinite(v))
 	) {
-		return res.status(400).json({ error: "Invalid telemetry payload" });
+		return false;
 	}
 
 	if (activeRecording && !is_spectating) {
@@ -252,7 +245,77 @@ app.post("/telemetry", (req, res) => {
 		damage_amount: damage_amount || 0,
 		was_fall_damage: !!was_fall_damage,
 	});
+
+	return true;
+}
+
+app.post("/telemetry", (req, res) => {
+	if (isRateLimited()) {
+		return res.status(429).json({ error: "Too many requests" });
+	}
+
+	if (!TELEMETRY_SECRET || req.get("X-Telemetry-Secret") !== TELEMETRY_SECRET) {
+		return res.status(401).json({ error: "Unauthorized" });
+	}
+
+	if (!req.body.data) {
+		return res.status(400).json({ error: "Missing 'data' field" });
+	}
+
+	let parsed;
+	try {
+		parsed = JSON.parse(req.body.data);
+	} catch (e) {
+		return res.status(400).json({ error: "Invalid JSON in 'data' field" });
+	}
+
+	const ok = processTelemetryEntry(parsed);
+	if (!ok) {
+		return res.status(400).json({ error: "Invalid telemetry payload" });
+	}
+
 	res.status(200).json({ ok: true });
+});
+
+// One request per server tick covering EVERY player, instead of one request
+// per player per tick. This is the actual fix for tracker-induced lag: the
+// per-player http.Post approach meant player count multiplied request count
+// directly, forcing a tradeoff between sample rate (smoothness) and request
+// volume (lag). Batching removes that tradeoff -- request count now depends
+// only on tick rate, not player count, so sample rate can go back up without
+// the lag returning.
+app.post("/telemetry/batch", (req, res) => {
+	if (isRateLimited()) {
+		return res.status(429).json({ error: "Too many requests" });
+	}
+
+	if (!TELEMETRY_SECRET || req.get("X-Telemetry-Secret") !== TELEMETRY_SECRET) {
+		return res.status(401).json({ error: "Unauthorized" });
+	}
+
+	if (!req.body.data) {
+		return res.status(400).json({ error: "Missing 'data' field" });
+	}
+
+	let parsedEntries;
+	try {
+		parsedEntries = JSON.parse(req.body.data);
+	} catch (e) {
+		return res.status(400).json({ error: "Invalid JSON in 'data' field" });
+	}
+
+	if (!Array.isArray(parsedEntries)) {
+		return res.status(400).json({ error: "'data' must be a JSON array of telemetry entries" });
+	}
+
+	let processed = 0;
+	for (const entry of parsedEntries) {
+		if (processTelemetryEntry(entry)) {
+			processed += 1;
+		}
+	}
+
+	res.status(200).json({ ok: true, processed: processed, total: parsedEntries.length });
 });
 
 app.get("/viewers", (req, res) => {
